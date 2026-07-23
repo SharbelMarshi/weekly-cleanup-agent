@@ -1,26 +1,18 @@
 #!/bin/zsh
-#
 # weekly-cleanup
-#
 # Weekly, dialog-confirmed macOS storage cleanup that deliberately preserves
 # Swift, Xcode, and project build data.
-#
 # Runs from the LaunchAgent: com.local.weekly-cleanup
 # Logs to:                   ~/Library/Logs/com.local.weekly-cleanup.log
-#
 # LaunchAgent Weekday values (the schedule uses the Mac's local timezone):
 #   0 = Sunday, 1 = Monday, 2 = Tuesday, 3 = Wednesday,
 #   4 = Thursday, 5 = Friday, 6 = Saturday
-#
 # Nothing is deleted unless the user selects "Clean now" in the confirmation
 # dialog. The dialog defaults to Cancel and cancels itself after 5 minutes.
 
 set -u
 
-# ===========================================================================
 # Configuration
-# ===========================================================================
-
 # Supports both Apple Silicon (/opt/homebrew/bin) and Intel (/usr/local/bin)
 # Homebrew installations. CLEANUP_PATH_OVERRIDE exists for the test suite.
 export PATH="${CLEANUP_PATH_OVERRIDE:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
@@ -83,9 +75,7 @@ pgrep_bin="${CLEANUP_PGREP:-/usr/bin/pgrep}"
 
 still_running_apps=()
 
-# ===========================================================================
 # Logging and notifications
-# ===========================================================================
 
 log() {
   print -r -- "$@"
@@ -102,9 +92,7 @@ send_notification() {
     >/dev/null 2>&1 || true
 }
 
-# ===========================================================================
 # Safety guards
-# ===========================================================================
 
 # Swift/Xcode data that must never be cleaned, whether named directly or
 # reached through a parent. This is a guard against accidental additions to

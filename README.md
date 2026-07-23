@@ -7,9 +7,6 @@ A confirmation-based weekly macOS cleanup tool that reclaims cache and package-m
 - Cleanup script: `~/.local/bin/weekly-cleanup`
 - Log file: `~/Library/Logs/com.local.weekly-cleanup.log`
 
-> Renamed from "Claude Cleanup for Mac users" (`com.local.claude-weekly-cleanup`).
-> Running `zsh install.sh` migrates an old-name installation automatically:
-> the existing schedule is preserved and the old agent and script are removed.
 
 ## How the warning dialog works
 
