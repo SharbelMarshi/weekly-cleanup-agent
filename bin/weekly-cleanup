@@ -1,0 +1,656 @@
+#!/bin/zsh
+#
+# weekly-cleanup
+#
+# Weekly, dialog-confirmed macOS storage cleanup that deliberately preserves
+# Swift, Xcode, and project build data.
+#
+# Runs from the LaunchAgent: com.local.weekly-cleanup
+# Logs to:                   ~/Library/Logs/com.local.weekly-cleanup.log
+#
+# LaunchAgent Weekday values (the schedule uses the Mac's local timezone):
+#   0 = Sunday, 1 = Monday, 2 = Tuesday, 3 = Wednesday,
+#   4 = Thursday, 5 = Friday, 6 = Saturday
+#
+# Nothing is deleted unless the user selects "Clean now" in the confirmation
+# dialog. The dialog defaults to Cancel and cancels itself after 5 minutes.
+
+set -u
+
+# ===========================================================================
+# Configuration
+# ===========================================================================
+
+# Supports both Apple Silicon (/opt/homebrew/bin) and Intel (/usr/local/bin)
+# Homebrew installations. CLEANUP_PATH_OVERRIDE exists for the test suite.
+export PATH="${CLEANUP_PATH_OVERRIDE:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+
+# Regular files under ~/Library/Logs older than this many days are deleted.
+log_retention_days="${CLEANUP_LOG_RETENTION_DAYS:-30}"
+
+# Seconds to wait for managed applications to quit before canceling.
+quit_wait_seconds="${CLEANUP_QUIT_WAIT_SECONDS:-15}"
+
+# Confirmation dialog timeout in seconds; timing out cancels the cleanup.
+dialog_timeout_seconds="${CLEANUP_DIALOG_TIMEOUT_SECONDS:-300}"
+
+log_dir="$HOME/Library/Logs"
+log_file="$log_dir/com.local.weekly-cleanup.log"
+trash_dir="$HOME/.Trash"
+
+# Only the CONTENTS of these directories are deleted; the directories
+# themselves are kept so applications can recreate their caches in place.
+# Claude's vm_bundles is fully disposable, but it is emptied the same way.
+cache_paths=(
+  # Visual Studio Code
+  "$HOME/Library/Application Support/Code/Cache"
+  "$HOME/Library/Application Support/Code/Code Cache"
+  "$HOME/Library/Application Support/Code/GPUCache"
+
+  # Intentionally excluded — CachedData holds pre-built workbench and
+  # extension-host data; deleting it slows the next VS Code launch:
+  #   "$HOME/Library/Application Support/Code/CachedData"
+
+  # Claude
+  "$HOME/Library/Application Support/Claude/vm_bundles"
+  "$HOME/Library/Application Support/Claude/Cache"
+  "$HOME/Library/Application Support/Claude/Code Cache"
+  "$HOME/Library/Application Support/Claude/GPUCache"
+
+  # Obsidian
+  "$HOME/Library/Application Support/obsidian/Cache"
+  "$HOME/Library/Application Support/obsidian/Code Cache"
+  "$HOME/Library/Application Support/obsidian/GPUCache"
+)
+
+# Opt-in only: extra cache directories, one per line, may be supplied via
+# CLEANUP_EXTRA_CACHE_PATHS. Every entry must live under ~/Library and pass
+# the Swift/Xcode protection checks below, or the whole run aborts before
+# anything is deleted.
+if [[ -n "${CLEANUP_EXTRA_CACHE_PATHS:-}" ]]; then
+  cache_paths+=(${(f)CLEANUP_EXTRA_CACHE_PATHS})
+fi
+
+# Managed applications: display names (AppleScript quit requests, messages)
+# and process names (pgrep -x), kept as parallel arrays.
+managed_app_names=("Visual Studio Code" "Claude" "Obsidian")
+managed_app_processes=("Code" "Claude" "Obsidian")
+
+# osascript and pgrep are overridable so the test suite can stub the GUI
+# dialog, notifications, quit requests, and process checks.
+osascript_bin="${CLEANUP_OSASCRIPT:-/usr/bin/osascript}"
+pgrep_bin="${CLEANUP_PGREP:-/usr/bin/pgrep}"
+
+still_running_apps=()
+
+# ===========================================================================
+# Logging and notifications
+# ===========================================================================
+
+log() {
+  print -r -- "$@"
+}
+
+timestamp() {
+  /bin/date "+%Y-%m-%d %H:%M:%S"
+}
+
+send_notification() {
+  local message="$1"
+  "$osascript_bin" \
+    -e "display notification \"$message\" with title \"Weekly Mac cleanup\"" \
+    >/dev/null 2>&1 || true
+}
+
+# ===========================================================================
+# Safety guards
+# ===========================================================================
+
+# Swift/Xcode data that must never be cleaned, whether named directly or
+# reached through a parent. This is a guard against accidental additions to
+# the target list; the script never searches the home directory for these.
+is_protected_build_path() {
+  local path="$1"
+
+  case "$path" in
+    "$HOME/Library/Developer" | \
+    "$HOME/Library/Developer/"* | \
+    "$HOME/.swiftpm" | \
+    "$HOME/.swiftpm/"* | \
+    "$HOME/Library/org.swift.swiftpm" | \
+    "$HOME/Library/org.swift.swiftpm/"* | \
+    "$HOME/Library/Caches/org.swift.swiftpm" | \
+    "$HOME/Library/Caches/org.swift.swiftpm/"* | \
+    */.build | \
+    */.build/* | \
+    */DerivedData | \
+    */DerivedData/* | \
+    */SourcePackages | \
+    */SourcePackages/* | \
+    */ModuleCache.noindex | \
+    */ModuleCache.noindex/* | \
+    */Archives | \
+    */Archives/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+# Broad parent directories that must never be cleanup targets themselves.
+is_forbidden_broad_path() {
+  local path="$1"
+
+  case "$path" in
+    / | /System | /Library | /Users | /private | \
+    "$HOME" | "$HOME/" | \
+    "$HOME/Library" | "$HOME/Library/" | \
+    "$HOME/Library/Caches" | \
+    "$HOME/Library/Application Support" | \
+    "$HOME/Library/Logs")
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+# Fatal pre-flight check: every cache target must sit under ~/Library, must
+# not be a broad parent, and must not be protected Swift/Xcode data.
+validate_cleanup_targets() {
+  local path
+  local failed=0
+
+  for path in "${cache_paths[@]}"; do
+    if is_forbidden_broad_path "$path"; then
+      log "FATAL: refusing broad cleanup target: $path"
+      failed=1
+      continue
+    fi
+
+    if [[ "$path" != "$HOME/Library/"?* ]]; then
+      log "FATAL: cleanup target is outside ~/Library: $path"
+      failed=1
+      continue
+    fi
+
+    if is_protected_build_path "$path"; then
+      log "FATAL: cleanup target is protected Swift/Xcode data: $path"
+      failed=1
+      continue
+    fi
+  done
+
+  return $failed
+}
+
+# ===========================================================================
+# Cache cleaning
+# ===========================================================================
+
+clean_directory_contents() {
+  local path="$1"
+
+  if is_protected_build_path "$path" || is_forbidden_broad_path "$path"; then
+    log "PROTECTED — refusing to clean: $path"
+    return 0
+  fi
+
+  if [[ -L "$path" ]]; then
+    log "Symbolic link; refusing to clean: $path"
+    return 0
+  fi
+
+  if [[ ! -d "$path" ]]; then
+    log "Not found; skipping: $path"
+    return 0
+  fi
+
+  log "Cleaning: $path"
+
+  /usr/bin/find "$path" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -exec /bin/rm -rf -- {} + 2>/dev/null
+
+  return 0
+}
+
+# ===========================================================================
+# Size estimate
+# ===========================================================================
+
+# Total size in bytes of user log files eligible for deletion. The script's
+# own log file is always excluded.
+old_log_files_bytes() {
+  local total=0 size f
+  local -a files
+
+  if [[ ! -d "$log_dir" ]]; then
+    print -r -- 0
+    return 0
+  fi
+
+  files=( ${(0)"$(/usr/bin/find "$log_dir" -type f \
+    -mtime +"$log_retention_days" -print0 2>/dev/null)"} )
+
+  for f in "${files[@]}"; do
+    [[ -n "$f" ]] || continue
+    [[ "$f" == "$log_file" ]] && continue
+    size=$(/usr/bin/stat -f %z "$f" 2>/dev/null) || size=0
+    [[ "$size" == <-> ]] && (( total += size ))
+  done
+
+  print -r -- "$total"
+}
+
+# Approximate reclaimable size in KB across the selected cache directories,
+# the Trash, and old user log files. Package-manager caches are excluded:
+# they cannot be measured reliably without slow recursive scans. Missing
+# directories and permission errors are tolerated.
+estimate_reclaimable_kb() {
+  local total_kb=0 kb path bytes
+
+  for path in "${cache_paths[@]}"; do
+    [[ -d "$path" && ! -L "$path" ]] || continue
+    kb=$(/usr/bin/du -sk "$path" 2>/dev/null | /usr/bin/awk 'NR==1 {print $1}')
+    [[ "$kb" == <-> ]] && (( total_kb += kb ))
+  done
+
+  if [[ -d "$trash_dir" && ! -L "$trash_dir" ]]; then
+    kb=$(/usr/bin/du -sk "$trash_dir" 2>/dev/null | /usr/bin/awk 'NR==1 {print $1}')
+    [[ "$kb" == <-> ]] && (( total_kb += kb ))
+  fi
+
+  bytes=$(old_log_files_bytes)
+  (( total_kb += bytes / 1024 ))
+
+  print -r -- "$total_kb"
+}
+
+format_kb() {
+  local kb="$1"
+
+  if (( kb >= 1048576 )); then
+    printf '%.2f GB' $(( kb / 1048576.0 ))
+  elif (( kb >= 1024 )); then
+    printf '%.1f MB' $(( kb / 1024.0 ))
+  else
+    printf '%d KB' "$kb"
+  fi
+}
+
+any_package_manager_available() {
+  local tool
+  for tool in npm pip3 pip brew pnpm yarn; do
+    command -v "$tool" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# ===========================================================================
+# Confirmation dialog
+# ===========================================================================
+
+show_confirmation_dialog() {
+  local size_text="$1"
+
+  "$osascript_bin" - "$size_text" "$dialog_timeout_seconds" \
+      "$log_retention_days" <<'APPLESCRIPT'
+on run argv
+    set sizeText to item 1 of argv
+    set timeoutSeconds to (item 2 of argv) as integer
+    set retentionDays to item 3 of argv
+    try
+        set messageText to "The weekly cleanup is ready.
+
+Estimated selected cache, log, and Trash size: " & sizeText & "
+
+This is an estimate. Package-manager cleanup may reclaim additional storage.
+
+It will clean:
+
+• Visual Studio Code Cache, Code Cache, and GPUCache
+• Claude vm_bundles, Cache, Code Cache, and GPUCache
+• Obsidian Cache, Code Cache, and GPUCache
+• npm cache verification and garbage collection
+• pip cache
+• Homebrew old versions and downloaded cache files
+• pnpm and Yarn caches when installed
+• User log files older than " & retentionDays & " days
+• Trash, except detected Swift and Xcode projects
+
+It will NOT clean:
+
+• Visual Studio Code CachedData
+• Xcode DerivedData, Archives, ModuleCache, SDKs, or simulators
+• SwiftPM caches
+• Project .build directories
+• Package.swift files
+• Xcode projects or workspaces
+• Homebrew packages through autoremove
+
+Visual Studio Code, Claude, and Obsidian will be asked to quit.
+
+Save any open work before continuing.
+
+No cleanup occurs unless you select Clean now."
+
+        set dialogResult to display dialog messageText ¬
+            buttons {"Cancel", "Clean now"} ¬
+            default button "Cancel" ¬
+            cancel button "Cancel" ¬
+            with icon caution ¬
+            giving up after timeoutSeconds
+
+        if gave up of dialogResult then
+            return "Cancel"
+        end if
+
+        return button returned of dialogResult
+    on error
+        return "Cancel"
+    end try
+end run
+APPLESCRIPT
+}
+
+# ===========================================================================
+# Managed applications
+# ===========================================================================
+
+is_process_running() {
+  "$pgrep_bin" -x "$1" >/dev/null 2>&1
+}
+
+request_quit_managed_apps() {
+  local i app process
+
+  for (( i = 1; i <= ${#managed_app_names[@]}; i++ )); do
+    app="${managed_app_names[i]}"
+    process="${managed_app_processes[i]}"
+
+    if is_process_running "$process"; then
+      log "Requesting $app to quit..."
+      "$osascript_bin" \
+        -e "tell application \"$app\" to quit" \
+        >/dev/null 2>&1 || true
+    else
+      log "$app is not running."
+    fi
+  done
+}
+
+refresh_running_managed_apps() {
+  local i
+  still_running_apps=()
+
+  for (( i = 1; i <= ${#managed_app_processes[@]}; i++ )); do
+    if is_process_running "${managed_app_processes[i]}"; then
+      still_running_apps+=("${managed_app_names[i]}")
+    fi
+  done
+}
+
+wait_for_managed_apps_to_quit() {
+  local waited=0
+
+  refresh_running_managed_apps
+
+  while (( ${#still_running_apps[@]} > 0 && waited < quit_wait_seconds )); do
+    /bin/sleep 1
+    (( waited += 1 ))
+    refresh_running_managed_apps
+  done
+}
+
+# ===========================================================================
+# Package managers
+# ===========================================================================
+
+run_package_manager_cleanup() {
+  log "Package-manager cleanup..."
+
+  # npm: verify + garbage-collect instead of `npm cache clean --force`,
+  # which would delete the entire cache and force full re-downloads.
+  if command -v npm >/dev/null 2>&1; then
+    log "npm found; running: npm cache verify"
+    if ! npm cache verify; then
+      log "npm: 'npm cache verify' returned an error; continuing."
+    fi
+  else
+    log "npm not found; skipped."
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    log "pip3 found; running: pip3 cache purge"
+    if ! pip3 cache purge; then
+      log "pip3: 'pip3 cache purge' returned an error; continuing."
+    fi
+  elif command -v pip >/dev/null 2>&1; then
+    log "pip found; running: pip cache purge"
+    if ! pip cache purge; then
+      log "pip: 'pip cache purge' returned an error; continuing."
+    fi
+  else
+    log "pip not found; skipped."
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    log "Homebrew found; running: brew cleanup --prune=all"
+    # Deliberately never `brew autoremove`: it can uninstall formulas,
+    # runtimes, SDKs, and development tools that other work depends on.
+    if ! brew cleanup --prune=all; then
+      log "Homebrew: 'brew cleanup --prune=all' returned an error; continuing."
+    fi
+  else
+    log "Homebrew not found; skipped."
+  fi
+
+  if command -v pnpm >/dev/null 2>&1; then
+    log "pnpm found; running: pnpm store prune"
+    if ! pnpm store prune; then
+      log "pnpm: 'pnpm store prune' returned an error; continuing."
+    fi
+  else
+    log "pnpm not found; skipped."
+  fi
+
+  if command -v yarn >/dev/null 2>&1; then
+    log "yarn found; running: yarn cache clean"
+    if ! yarn cache clean; then
+      log "yarn: 'yarn cache clean' returned an error; continuing."
+    fi
+  else
+    log "yarn not found; skipped."
+  fi
+}
+
+# ===========================================================================
+# User log retention
+# ===========================================================================
+
+clean_old_user_logs() {
+  local deleted=0 f
+  local -a old_files
+
+  if [[ ! -d "$log_dir" ]]; then
+    log "Logs directory not found; skipping log retention."
+    return 0
+  fi
+
+  log "Deleting user log files older than $log_retention_days day(s)..."
+
+  old_files=( ${(0)"$(/usr/bin/find "$log_dir" -type f \
+    -mtime +"$log_retention_days" -print0 2>/dev/null)"} )
+
+  for f in "${old_files[@]}"; do
+    [[ -n "$f" ]] || continue
+    # Never delete the log file this script is writing to.
+    [[ "$f" == "$log_file" ]] && continue
+
+    if /bin/rm -f -- "$f" 2>/dev/null; then
+      (( deleted += 1 ))
+    else
+      log "Failed to delete old log file: $f"
+    fi
+  done
+
+  log "Deleted $deleted old user log file(s)."
+
+  # Remove now-empty subdirectories; ~/Library/Logs itself is kept.
+  /usr/bin/find "$log_dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+  return 0
+}
+
+# ===========================================================================
+# Trash
+# ===========================================================================
+
+# A Trash item is preserved when it is named like build output or contains a
+# Swift/Xcode project marker within three directory levels. Symbolic links
+# are never followed while inspecting.
+looks_like_swift_project_or_build() {
+  local item="$1"
+  local name="${item:t}"
+
+  case "$name" in
+    .build | DerivedData | SourcePackages | \
+    ModuleCache.noindex | Archives)
+      return 0
+      ;;
+  esac
+
+  [[ -d "$item" && ! -L "$item" ]] || return 1
+
+  if /usr/bin/find "$item" \
+      -maxdepth 3 \
+      \( \
+        -name "Package.swift" -o \
+        -name "*.xcodeproj" -o \
+        -name "*.xcworkspace" -o \
+        -name ".build" \
+      \) \
+      -print -quit 2>/dev/null |
+      /usr/bin/grep -q .; then
+    return 0
+  fi
+
+  return 1
+}
+
+empty_trash_preserving_swift_projects() {
+  local item skipped=0 deleted=0
+  local -a trash_items
+
+  if [[ ! -d "$trash_dir" ]]; then
+    log "Trash directory not found; skipping."
+    return 0
+  fi
+
+  log "Emptying Trash (Swift/Xcode projects are preserved)..."
+
+  # D includes hidden entries; N prevents an unmatched-glob error.
+  trash_items=( "$trash_dir"/*(DN) )
+
+  for item in "${trash_items[@]}"; do
+    if looks_like_swift_project_or_build "$item"; then
+      log "PROTECTED in Trash; skipped: $item"
+      (( skipped += 1 ))
+      continue
+    fi
+
+    if /bin/rm -rf -- "$item" 2>/dev/null; then
+      (( deleted += 1 ))
+    else
+      log "Failed to delete Trash item: $item"
+    fi
+  done
+
+  log "Trash: deleted $deleted item(s), preserved $skipped Swift/Xcode-related item(s)."
+  return 0
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+main() {
+  /bin/mkdir -p "$log_dir"
+  exec >>"$log_file" 2>&1
+
+  log ""
+  log "=================================================="
+  log "Weekly cleanup started: $(timestamp)"
+  log "=================================================="
+
+  if (( EUID == 0 )); then
+    log "FATAL: refusing to run as root."
+    send_notification "Cleanup stopped: refusing to run as root."
+    log "Final status: failed at $(timestamp)"
+    exit 1
+  fi
+
+  if ! validate_cleanup_targets; then
+    send_notification "Cleanup stopped: a target failed the Swift/Xcode safety check. See the log."
+    log "Final status: failed (fatal safety check) at $(timestamp)"
+    exit 1
+  fi
+
+  local estimate_kb estimate_display
+  estimate_kb=$(estimate_reclaimable_kb)
+  estimate_display=$(format_kb "$estimate_kb")
+  log "Estimated reclaimable size (selected caches, old logs, Trash): $estimate_display"
+
+  if (( estimate_kb == 0 )) && ! any_package_manager_available; then
+    log "No eligible cleanup targets were found."
+    send_notification "No eligible cleanup targets were found. Nothing to clean."
+    log "Final status: completed (nothing to clean) at $(timestamp)"
+    exit 0
+  fi
+
+  local choice
+  choice=$(show_confirmation_dialog "$estimate_display")
+
+  if [[ "$choice" != "Clean now" ]]; then
+    log "Cleanup canceled from the confirmation dialog."
+    log "Final status: canceled at $(timestamp)"
+    exit 0
+  fi
+
+  log "User confirmed: Clean now"
+
+  request_quit_managed_apps
+  wait_for_managed_apps_to_quit
+
+  if (( ${#still_running_apps[@]} > 0 )); then
+    local app_list="${(j:, :)still_running_apps}"
+    log "Canceled: applications still running after ${quit_wait_seconds}s: $app_list"
+    send_notification "Cleanup canceled. Still running: $app_list"
+    log "Final status: canceled at $(timestamp)"
+    exit 1
+  fi
+
+  log "Cleaning selected application caches..."
+  local cache_path
+  for cache_path in "${cache_paths[@]}"; do
+    clean_directory_contents "$cache_path"
+  done
+
+  run_package_manager_cleanup
+  clean_old_user_logs
+  empty_trash_preserving_swift_projects
+
+  log "Cleanup completed: $(timestamp)"
+  log "Final status: completed"
+  send_notification "Weekly cleanup completed. Swift and Xcode build data was preserved."
+  exit 0
+}
+
+# Run main only when executed directly; sourcing (used by the test suite)
+# loads the functions without side effects.
+if [[ "${zsh_eval_context[-1]:-toplevel}" == "toplevel" ]]; then
+  main "$@"
+fi
