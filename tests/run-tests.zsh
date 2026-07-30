@@ -129,15 +129,40 @@ if [[ "${1:-}" == "-e" ]]; then
   exit 0
 fi
 
+# Dialogs are invoked as: osascript - <kind> <arguments...>
 if [[ "${1:-}" == "-" ]]; then
   /bin/cat > /dev/null
-  print -r -- "dialog size=${2:-} timeout=${3:-} retention=${4:-} mode=${MOCK_DIALOG_MODE:-choice}" \
-    >> "$state/dialogs.log"
+  kind="${2:-confirm}"
 
-  case "${MOCK_DIALOG_MODE:-choice}" in
-    timeout) print -r -- "Cancel" ;;
-    error)   exit 1 ;;
-    *)       print -r -- "${MOCK_DIALOG_CHOICE:-Cancel}" ;;
+  case "$kind" in
+    menu)
+      print -r -- "dialog kind=menu timeout=${3:-} mode=${MOCK_MENU_MODE:-choice}" \
+        >> "$state/dialogs.log"
+      case "${MOCK_MENU_MODE:-choice}" in
+        timeout) print -r -- "Cancel" ;;
+        error)   exit 1 ;;
+        *)       print -r -- "${MOCK_MENU_CHOICE:-Cancel}" ;;
+      esac
+      ;;
+
+    scan)
+      print -r -- "dialog kind=scan items=$(( $# - 3 ))" >> "$state/dialogs.log"
+      shift 3
+      for line in "$@"; do
+        print -r -- "$line" >> "$state/scan-items.log"
+      done
+      print -r -- "${MOCK_SCAN_SELECTION:-}"
+      ;;
+
+    *)
+      print -r -- "dialog kind=confirm size=${3:-} timeout=${4:-} retention=${5:-} mode=${MOCK_DIALOG_MODE:-choice}" \
+        >> "$state/dialogs.log"
+      case "${MOCK_DIALOG_MODE:-choice}" in
+        timeout) print -r -- "Cancel" ;;
+        error)   exit 1 ;;
+        *)       print -r -- "${MOCK_DIALOG_CHOICE:-Cancel}" ;;
+      esac
+      ;;
   esac
   exit 0
 fi
@@ -145,6 +170,13 @@ fi
 exit 0
 MOCK
 /bin/chmod 755 "$mockbin/osascript"
+
+/bin/cat > "$mockbin/open" <<'MOCK'
+#!/bin/zsh
+set -u
+print -r -- "$*" >> "${MOCK_STATE_DIR:?}/opened.log"
+MOCK
+/bin/chmod 755 "$mockbin/open"
 
 /bin/cat > "$mockbin/pgrep" <<'MOCK'
 #!/bin/zsh
@@ -201,20 +233,65 @@ new_fixture() {
   /bin/mkdir -p "$fixture/Library/Caches/org.swift.swiftpm/repositories"
 }
 
-# run_script [EXTRA_ENV=value ...] — runs the cleanup script against the
-# current fixture; extra env assignments override the defaults.
+# run_script [EXTRA_ENV=value ...] [-- SCRIPT_ARG ...] — runs the cleanup
+# script against the current fixture; extra env assignments override the
+# defaults, and anything after -- is passed to the script itself.
+# The menu defaults to "Cleanup" so the cleanup flow stays the default path.
 run_script() {
+  local arg
+  local -a env_args script_args
+  local -i after_marker=0
+
+  for arg in "$@"; do
+    if [[ "$arg" == "--" && after_marker -eq 0 ]]; then
+      after_marker=1
+      continue
+    fi
+    if (( after_marker )); then
+      script_args+=("$arg")
+    else
+      env_args+=("$arg")
+    fi
+  done
+
   /usr/bin/env \
     HOME="$fixture" \
     CLEANUP_PATH_OVERRIDE="$pkgbin" \
     CLEANUP_OSASCRIPT="$mockbin/osascript" \
     CLEANUP_PGREP="$mockbin/pgrep" \
+    CLEANUP_OPEN="$mockbin/open" \
     CLEANUP_QUIT_WAIT_SECONDS=1 \
     MOCK_STATE_DIR="$state" \
+    MOCK_MENU_CHOICE="Cleanup" \
     MOCK_DIALOG_CHOICE="Clean now" \
-    "$@" \
-    /bin/zsh "$cleanup_script"
+    "${env_args[@]}" \
+    /bin/zsh "$cleanup_script" "${script_args[@]}"
   script_status=$?
+}
+
+fixture_scan_report() {
+  print -r -- "$fixture/Library/Logs/com.local.weekly-cleanup-scan.txt"
+}
+
+# The first path line under a section heading of the scan report.
+first_report_entry_after() {
+  /usr/bin/awk -v heading="$1" \
+    'index($0, heading) { found = 1; next }
+     found && index($0, "/") { print; exit }' \
+    "$(fixture_scan_report)" 2>/dev/null
+}
+
+report_line_number() {
+  /usr/bin/grep -nF -- "$1" "$(fixture_scan_report)" 2>/dev/null |
+    /usr/bin/head -n 1 | /usr/bin/cut -d: -f1
+}
+
+# True when the first path is listed above the second one in the report.
+listed_before() {
+  local a b
+  a="$(report_line_number "$1")"
+  b="$(report_line_number "$2")"
+  [[ -n "$a" && -n "$b" ]] && (( a < b ))
 }
 
 # Unit-test helpers: source the script (main does not run) and call one
@@ -355,8 +432,11 @@ assert_true "VS Code asked to quit" \
   file_contains "$state/quits.log" "Visual Studio Code"
 assert_true "Claude asked to quit" file_contains "$state/quits.log" "Claude"
 assert_true "Obsidian asked to quit" file_contains "$state/quits.log" "Obsidian"
-assert_true "dialog showed the size estimate" \
-  file_contains "$state/dialogs.log" "size="
+assert_true "menu dialog was shown first" \
+  file_contains "$state/dialogs.log" "kind=menu"
+assert_true "confirmation dialog showed the size estimate" \
+  file_contains "$state/dialogs.log" "kind=confirm size="
+assert_log_contains "selected action logged" "Selected action: cleanup"
 assert_true "success notification sent" \
   file_contains "$state/notifications.log" "completed"
 assert_true "npm used cache verify" \
@@ -524,7 +604,136 @@ run_script CLEANUP_PATH_OVERRIDE="$emptybin"
 assert_status "exits 0" 0
 assert_true "nothing-to-clean notification sent" \
   file_contains "$state/notifications.log" "No eligible cleanup targets"
-assert_true "no dialog was shown" test ! -e "$state/dialogs.log"
+assert_false "no confirmation dialog was shown" \
+  file_contains "$state/dialogs.log" "kind=confirm"
+
+section "action menu"
+new_fixture
+print -r -- "junk" > "$fixture/.Trash/file.txt"
+run_script MOCK_MENU_CHOICE="Cancel"
+assert_status "cancel exits 0" 0
+assert_true "menu dialog was shown" file_contains "$state/dialogs.log" "kind=menu"
+assert_false "no confirmation dialog after cancel" \
+  file_contains "$state/dialogs.log" "kind=confirm"
+assert_true "Trash untouched" test -f "$fixture/.Trash/file.txt"
+assert_true "no quit requests sent" test ! -e "$state/quits.log"
+assert_log_contains "cancel logged" "Final status: canceled"
+
+new_fixture
+print -r -- "junk" > "$fixture/.Trash/file.txt"
+run_script MOCK_MENU_MODE="timeout"
+assert_status "timeout exits 0" 0
+assert_true "Trash untouched after menu timeout" test -f "$fixture/.Trash/file.txt"
+assert_log_contains "menu timeout cancels" "Final status: canceled"
+
+new_fixture
+print -r -- "junk" > "$fixture/.Trash/file.txt"
+run_script MOCK_MENU_MODE="error"
+assert_status "AppleScript error exits 0" 0
+assert_true "Trash untouched after menu error" test -f "$fixture/.Trash/file.txt"
+assert_log_contains "menu error cancels" "Final status: canceled"
+
+new_fixture
+print -r -- "junk" > "$fixture/.Trash/file.txt"
+run_script -- --cleanup
+assert_status "--cleanup exits 0" 0
+assert_false "menu skipped with --cleanup" \
+  file_contains "$state/dialogs.log" "kind=menu"
+assert_true "confirmation dialog shown" \
+  file_contains "$state/dialogs.log" "kind=confirm"
+assert_false "Trash emptied" test -e "$fixture/.Trash/file.txt"
+assert_log_contains "cleanup completed" "Final status: completed"
+
+new_fixture
+run_script -- --help >/dev/null 2>&1
+assert_status "--help exits 0" 0
+assert_false "--help does nothing else" test -e "$(fixture_log)"
+new_fixture
+run_script -- --bogus >/dev/null 2>&1
+assert_status "unknown option exits 2" 2
+assert_false "unknown option does nothing else" test -e "$(fixture_log)"
+
+section "storage scan (read-only)"
+new_fixture
+scan_root="$fixture/scandata"
+/bin/mkdir -p "$scan_root/big/nested" "$scan_root/small" "$scan_root/dir with spaces"
+/bin/dd if=/dev/zero of="$scan_root/big/nested/biggest.bin" \
+  bs=1048576 count=4 >/dev/null 2>&1
+/bin/dd if=/dev/zero of="$scan_root/dir with spaces/medium file.bin" \
+  bs=1048576 count=2 >/dev/null 2>&1
+print -r -- "tiny" > "$scan_root/small/tiny.txt"
+print -r -- "junk" > "$fixture/.Trash/file.txt"
+print -r -- "Code" >> "$state/running"
+
+run_script MOCK_MENU_CHOICE="Scan" CLEANUP_SCAN_ROOTS="$scan_root" \
+  CLEANUP_SCAN_MIN_FILE_MB=1
+assert_status "exits 0" 0
+assert_true "scan report written" test -f "$(fixture_scan_report)"
+assert_true "report lists folders section" \
+  file_contains "$(fixture_scan_report)" "Largest folders"
+assert_true "report lists files section" \
+  file_contains "$(fixture_scan_report)" "Largest files"
+assert_true "the scanned root, holding everything, is listed first" \
+  str_eq "$(first_report_entry_after 'Largest folders')" \
+  "$(printf '%10s   %s' '6.0 MB' "$scan_root")"
+assert_true "folders are ranked largest to smallest" \
+  listed_before "$scan_root/big/nested" "$scan_root/dir with spaces"
+assert_true "smallest folder ranked last" \
+  listed_before "$scan_root/dir with spaces" "$scan_root/small"
+assert_true "biggest file listed first" \
+  str_eq "$(first_report_entry_after 'Largest files')" \
+  "$(printf '%10s   %s' '4.0 MB' "$scan_root/big/nested/biggest.bin")"
+assert_true "file in a path with spaces listed" \
+  file_contains "$(fixture_scan_report)" "$scan_root/dir with spaces/medium file.bin"
+assert_false "files under the size floor are not listed" \
+  file_contains "$(fixture_scan_report)" "tiny.txt"
+assert_true "results dialog was shown" \
+  file_contains "$state/dialogs.log" "kind=scan"
+assert_true "results dialog received the report lines" \
+  file_contains "$state/scan-items.log" "$scan_root/big/nested/biggest.bin"
+assert_log_contains "scan report path logged" "Scan report:"
+assert_log_contains "scan final status" "Final status: completed (scan)"
+
+# The scan must not touch anything.
+assert_false "no confirmation dialog shown" \
+  file_contains "$state/dialogs.log" "kind=confirm"
+assert_true "caches untouched" \
+  test -f "$fixture/Library/Application Support/Code/Cache/cache file with spaces.tmp"
+assert_true "Trash untouched" test -f "$fixture/.Trash/file.txt"
+assert_true "scanned files untouched" \
+  test -f "$scan_root/big/nested/biggest.bin"
+assert_true "no quit requests sent" test ! -e "$state/quits.log"
+assert_true "no package-manager commands run" test ! -e "$state/commands.log"
+
+section "scan: --scan flag, reveal, and missing roots"
+new_fixture
+scan_root="$fixture/scandata"
+/bin/mkdir -p "$scan_root/big"
+/bin/dd if=/dev/zero of="$scan_root/big/biggest.bin" \
+  bs=1048576 count=2 >/dev/null 2>&1
+run_script CLEANUP_SCAN_ROOTS="$scan_root
+$fixture/does-not-exist" CLEANUP_SCAN_MIN_FILE_MB=1 \
+  MOCK_MENU_CHOICE="Cancel" \
+  MOCK_SCAN_SELECTION="    2.0 MB   $scan_root/big/biggest.bin" \
+  -- --scan
+assert_status "exits 0" 0
+assert_false "menu skipped with --scan" \
+  file_contains "$state/dialogs.log" "kind=menu"
+assert_true "missing scan root tolerated" \
+  file_contains "$(fixture_scan_report)" "$scan_root/big"
+assert_true "selected path revealed in Finder" \
+  file_contains "$state/opened.log" "$scan_root/big/biggest.bin"
+assert_log_contains "reveal logged" "Revealing in Finder:"
+assert_true "revealed file untouched" test -f "$scan_root/big/biggest.bin"
+
+new_fixture
+/bin/mkdir -p "$fixture/scandata"
+run_script CLEANUP_SCAN_ROOTS="$fixture/scandata" \
+  MOCK_SCAN_SELECTION="── Largest folders (top 30) ──" -- --scan
+assert_status "exits 0" 0
+assert_true "section headings are not revealed" test ! -e "$state/opened.log"
+assert_true "empty section reported" \
+  file_contains "$(fixture_scan_report)" "(nothing found)"
 
 section "installer: fresh install and schedule preservation"
 new_fixture

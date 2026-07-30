@@ -7,8 +7,13 @@
 # LaunchAgent Weekday values (the schedule uses the Mac's local timezone):
 #   0 = Sunday, 1 = Monday, 2 = Tuesday, 3 = Wednesday,
 #   4 = Thursday, 5 = Friday, 6 = Saturday
-# Nothing is deleted unless the user selects "Clean now" in the confirmation
-# dialog. The dialog defaults to Cancel and cancels itself after 5 minutes.
+#
+# The run opens a menu dialog with two actions:
+#   Cleanup — shows the detailed confirmation dialog; nothing is deleted
+#             unless the user then selects "Clean now".
+#   Scan    — read-only storage report listing the folders and files using
+#             the most space, largest first. It never deletes anything.
+# The menu defaults to Cancel and cancels itself after 5 minutes.
 
 set -u
 
@@ -63,15 +68,46 @@ if [[ -n "${CLEANUP_EXTRA_CACHE_PATHS:-}" ]]; then
   cache_paths+=(${(f)CLEANUP_EXTRA_CACHE_PATHS})
 fi
 
+# Storage scan (the "Scan" action). The scan only reads sizes: it never
+# deletes, moves, or modifies anything, and it never uses sudo.
+#
+# Directories the scan measures. Override with CLEANUP_SCAN_ROOTS, one
+# absolute path per line. Missing roots are skipped.
+scan_roots=(
+  "$HOME"
+  /Applications
+  /Library
+  /usr/local
+  /opt
+)
+
+if [[ -n "${CLEANUP_SCAN_ROOTS:-}" ]]; then
+  scan_roots=(${(f)CLEANUP_SCAN_ROOTS})
+fi
+
+# How many directory levels below each root are measured individually.
+scan_depth="${CLEANUP_SCAN_DEPTH:-3}"
+
+# How many entries each section of the report lists.
+scan_top_folders="${CLEANUP_SCAN_TOP_FOLDERS:-30}"
+scan_top_files="${CLEANUP_SCAN_TOP_FILES:-20}"
+
+# Individual files smaller than this (in MB) are not listed.
+scan_min_file_mb="${CLEANUP_SCAN_MIN_FILE_MB:-100}"
+
+# The full scan report is written here, overwritten by each scan.
+scan_report_file="$log_dir/com.local.weekly-cleanup-scan.txt"
+
 # Managed applications: display names (AppleScript quit requests, messages)
 # and process names (pgrep -x), kept as parallel arrays.
 managed_app_names=("Visual Studio Code" "Claude" "Obsidian")
 managed_app_processes=("Code" "Claude" "Obsidian")
 
-# osascript and pgrep are overridable so the test suite can stub the GUI
-# dialog, notifications, quit requests, and process checks.
+# osascript, pgrep, and open are overridable so the test suite can stub the
+# GUI dialogs, notifications, quit requests, process checks, and Finder.
 osascript_bin="${CLEANUP_OSASCRIPT:-/usr/bin/osascript}"
 pgrep_bin="${CLEANUP_PGREP:-/usr/bin/pgrep}"
+open_bin="${CLEANUP_OPEN:-/usr/bin/open}"
 
 still_running_apps=()
 
@@ -278,18 +314,59 @@ any_package_manager_available() {
 }
 
 # ===========================================================================
-# Confirmation dialog
+# Dialogs
 # ===========================================================================
+# Every dialog is invoked as: osascript - <kind> <arguments...>
+# The leading kind ("menu", "confirm", "scan") lets the test suite tell the
+# dialogs apart. Any AppleScript error, an Escape press, or the dialog timing
+# out is treated as Cancel — the safe outcome in every case.
+
+# The first window of a run: pick an action. Returns "Cleanup", "Scan", or
+# "Cancel".
+show_main_menu_dialog() {
+  "$osascript_bin" - "menu" "$dialog_timeout_seconds" <<'APPLESCRIPT'
+on run argv
+    set timeoutSeconds to (item 2 of argv) as integer
+    try
+        set messageText to "The weekly cleanup is ready.
+
+Choose what to do:
+
+• Cleanup — review exactly what will be removed, then confirm. Nothing is deleted until you select Clean now in the next window.
+
+• Scan — look at storage only. Lists the folders and files using the most space, largest first. It deletes nothing.
+
+Cancel closes this window and does nothing."
+
+        set dialogResult to display dialog messageText ¬
+            buttons {"Cancel", "Scan", "Cleanup"} ¬
+            default button "Cancel" ¬
+            cancel button "Cancel" ¬
+            with title "Weekly Mac cleanup" ¬
+            with icon note ¬
+            giving up after timeoutSeconds
+
+        if gave up of dialogResult then
+            return "Cancel"
+        end if
+
+        return button returned of dialogResult
+    on error
+        return "Cancel"
+    end try
+end run
+APPLESCRIPT
+}
 
 show_confirmation_dialog() {
   local size_text="$1"
 
-  "$osascript_bin" - "$size_text" "$dialog_timeout_seconds" \
+  "$osascript_bin" - "confirm" "$size_text" "$dialog_timeout_seconds" \
       "$log_retention_days" <<'APPLESCRIPT'
 on run argv
-    set sizeText to item 1 of argv
-    set timeoutSeconds to (item 2 of argv) as integer
-    set retentionDays to item 3 of argv
+    set sizeText to item 2 of argv
+    set timeoutSeconds to (item 3 of argv) as integer
+    set retentionDays to item 4 of argv
     try
         set messageText to "The weekly cleanup is ready.
 
@@ -342,6 +419,180 @@ No cleanup occurs unless you select Clean now."
     end try
 end run
 APPLESCRIPT
+}
+
+# Scrollable list of the scan results, largest first. Each argument after the
+# title is one line of the report. Returns the selected line, or an empty
+# string when the window was closed without a selection.
+show_scan_results_dialog() {
+  local prompt="Storage used, largest first. Nothing was deleted — the scan only reads sizes.
+
+Select a line and choose Reveal in Finder, or choose Close.
+Full report: $scan_report_file"
+
+  "$osascript_bin" - "scan" "$prompt" "Weekly Mac cleanup — storage scan" \
+      "$@" <<'APPLESCRIPT'
+on run argv
+    set promptText to item 2 of argv
+    set titleText to item 3 of argv
+    try
+        if (count of argv) > 3 then
+            set theItems to items 4 thru -1 of argv
+        else
+            set theItems to {"The scan produced no results."}
+        end if
+
+        try
+            activate
+        end try
+
+        set chosen to choose from list theItems ¬
+            with prompt promptText ¬
+            with title titleText ¬
+            OK button name "Reveal in Finder" ¬
+            cancel button name "Close" ¬
+            without multiple selections allowed
+
+        if chosen is false then
+            return ""
+        end if
+
+        return item 1 of chosen
+    on error
+        return ""
+    end try
+end run
+APPLESCRIPT
+}
+
+# ===========================================================================
+# Storage scan (read-only)
+# ===========================================================================
+
+# "size-in-KB<TAB>path" for every directory within scan_depth levels of each
+# scan root. Filesystem boundaries are never crossed (-x), so mounted volumes
+# and network shares are left alone. Unreadable directories are skipped.
+scan_folder_sizes() {
+  local root
+  for root in "${scan_roots[@]}"; do
+    [[ -n "$root" && -d "$root" && ! -L "$root" ]] || continue
+    /usr/bin/du -x -k -d "$scan_depth" "$root" 2>/dev/null
+  done
+}
+
+# "size-in-bytes path" for every regular file of at least scan_min_file_mb MB.
+# Symbolic links are never followed.
+scan_large_files() {
+  local root
+  for root in "${scan_roots[@]}"; do
+    [[ -n "$root" && -d "$root" && ! -L "$root" ]] || continue
+    /usr/bin/find -x "$root" -type f -size +"${scan_min_file_mb}"M \
+      -exec /usr/bin/stat -f '%z %N' {} + 2>/dev/null
+  done
+}
+
+# Turns "<size><separator><path>" lines on stdin into aligned report lines.
+# The unit of the incoming size is either "kb" (du) or "bytes" (stat).
+format_scan_lines() {
+  local unit="$1"
+  local size path kb
+  local -i shown=0
+
+  while IFS=$' \t' read -r size path; do
+    [[ "$size" == <-> && -n "$path" ]] || continue
+
+    if [[ "$unit" == "bytes" ]]; then
+      kb=$(( size / 1024 ))
+    else
+      kb="$size"
+    fi
+
+    printf '%10s   %s\n' "$(format_kb "$kb")" "$path"
+    (( shown += 1 ))
+  done
+
+  (( shown > 0 )) || print -r -- "           (nothing found)"
+}
+
+# Builds the ranked report, writes it to scan_report_file and the log, then
+# shows it. Reading sizes is all this does; nothing is ever removed.
+run_storage_scan() {
+  local tmp_dir line selection
+  local started=$SECONDS
+  local -a report_lines
+
+  log "Storage scan started (read-only)."
+  log "Scan roots: ${(j:, :)scan_roots}"
+  send_notification "Storage scan started. Large disks can take a few minutes."
+
+  tmp_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/weekly-cleanup-scan.XXXXXX") || {
+    log "Storage scan failed: could not create a temporary directory."
+    send_notification "Storage scan failed. See the log."
+    log "Final status: failed at $(timestamp)"
+    return 1
+  }
+
+  scan_folder_sizes | /usr/bin/sort -rn -k1,1 |
+    /usr/bin/head -n "$scan_top_folders" > "$tmp_dir/folders"
+
+  scan_large_files | /usr/bin/sort -rn -k1,1 |
+    /usr/bin/head -n "$scan_top_files" > "$tmp_dir/files"
+
+  report_lines=( "── Largest folders (top $scan_top_folders) ──" )
+  report_lines+=( ${(f)"$(format_scan_lines kb < "$tmp_dir/folders")"} )
+  report_lines+=( "" )
+  report_lines+=(
+    "── Largest files over ${scan_min_file_mb} MB (top $scan_top_files) ──" )
+  report_lines+=( ${(f)"$(format_scan_lines bytes < "$tmp_dir/files")"} )
+
+  /bin/rm -rf -- "$tmp_dir" 2>/dev/null
+
+  {
+    print -r -- "Weekly Mac cleanup — storage scan"
+    print -r -- "Generated: $(timestamp)"
+    print -r -- "Scanned (read-only): ${(j:, :)scan_roots}"
+    print -r -- "Folder depth: $scan_depth levels below each scanned root."
+    print -r -- "Folders are nested, so a parent folder also counts everything"
+    print -r -- "listed below it. Nothing was deleted, moved, or modified."
+    print -r -- ""
+    for line in "${report_lines[@]}"; do
+      print -r -- "$line"
+    done
+  } > "$scan_report_file" 2>/dev/null ||
+    log "Could not write the scan report to $scan_report_file"
+
+  for line in "${report_lines[@]}"; do
+    log "$line"
+  done
+
+  log "Storage scan finished in $(( SECONDS - started ))s."
+  log "Scan report: $scan_report_file"
+
+  selection=$(show_scan_results_dialog "${report_lines[@]}")
+
+  # Report lines are "<size>   <absolute path>"; a line without a path is a
+  # section header and is not something to reveal.
+  if [[ "$selection" == */* ]]; then
+    reveal_in_finder "/${selection#*/}"
+  fi
+
+  log "Final status: completed (scan) at $(timestamp)"
+  return 0
+}
+
+reveal_in_finder() {
+  local path="$1"
+
+  if [[ ! -e "$path" ]]; then
+    log "Reveal skipped; path no longer exists: $path"
+    return 0
+  fi
+
+  log "Revealing in Finder: $path"
+  "$open_bin" -R -- "$path" >/dev/null 2>&1 ||
+    log "Could not reveal in Finder: $path"
+
+  return 0
 }
 
 # ===========================================================================
@@ -562,32 +813,15 @@ empty_trash_preserving_swift_projects() {
 }
 
 # ===========================================================================
-# Main
+# Cleanup flow
 # ===========================================================================
 
-main() {
-  /bin/mkdir -p "$log_dir"
-  exec >>"$log_file" 2>&1
+# The "Cleanup" action: estimate, confirm, quit the managed applications,
+# then clean. Nothing is deleted before the confirmation dialog is answered
+# with "Clean now".
+run_cleanup_flow() {
+  local estimate_kb estimate_display choice cache_path
 
-  log ""
-  log "=================================================="
-  log "Weekly cleanup started: $(timestamp)"
-  log "=================================================="
-
-  if (( EUID == 0 )); then
-    log "FATAL: refusing to run as root."
-    send_notification "Cleanup stopped: refusing to run as root."
-    log "Final status: failed at $(timestamp)"
-    exit 1
-  fi
-
-  if ! validate_cleanup_targets; then
-    send_notification "Cleanup stopped: a target failed the Swift/Xcode safety check. See the log."
-    log "Final status: failed (fatal safety check) at $(timestamp)"
-    exit 1
-  fi
-
-  local estimate_kb estimate_display
   estimate_kb=$(estimate_reclaimable_kb)
   estimate_display=$(format_kb "$estimate_kb")
   log "Estimated reclaimable size (selected caches, old logs, Trash): $estimate_display"
@@ -596,16 +830,15 @@ main() {
     log "No eligible cleanup targets were found."
     send_notification "No eligible cleanup targets were found. Nothing to clean."
     log "Final status: completed (nothing to clean) at $(timestamp)"
-    exit 0
+    return 0
   fi
 
-  local choice
   choice=$(show_confirmation_dialog "$estimate_display")
 
   if [[ "$choice" != "Clean now" ]]; then
     log "Cleanup canceled from the confirmation dialog."
     log "Final status: canceled at $(timestamp)"
-    exit 0
+    return 0
   fi
 
   log "User confirmed: Clean now"
@@ -618,11 +851,10 @@ main() {
     log "Canceled: applications still running after ${quit_wait_seconds}s: $app_list"
     send_notification "Cleanup canceled. Still running: $app_list"
     log "Final status: canceled at $(timestamp)"
-    exit 1
+    return 1
   fi
 
   log "Cleaning selected application caches..."
-  local cache_path
   for cache_path in "${cache_paths[@]}"; do
     clean_directory_contents "$cache_path"
   done
@@ -634,11 +866,93 @@ main() {
   log "Cleanup completed: $(timestamp)"
   log "Final status: completed"
   send_notification "Weekly cleanup completed. Swift and Xcode build data was preserved."
-  exit 0
+  return 0
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+usage() {
+  /bin/cat <<'USAGE'
+Weekly, dialog-confirmed macOS storage cleanup.
+
+Usage:
+  weekly-cleanup [--menu | --cleanup | --scan]
+
+Options:
+  --menu      Ask which action to run (default; used by the LaunchAgent)
+  --cleanup   Go straight to the cleanup confirmation dialog
+  --scan      Go straight to the read-only storage scan
+  -h, --help  Show this help
+
+Output goes to ~/Library/Logs/com.local.weekly-cleanup.log
+USAGE
+}
+
+main() {
+  local mode="menu" action rc=0
+
+  # Argument errors are reported before stdout is redirected to the log.
+  while (( $# > 0 )); do
+    case "$1" in
+      --menu)    mode="menu";    shift ;;
+      --cleanup) mode="cleanup"; shift ;;
+      --scan)    mode="scan";    shift ;;
+      -h|--help) usage; return 0 ;;
+      *) print -u2 -r -- "Unknown option: $1"; usage; return 2 ;;
+    esac
+  done
+
+  /bin/mkdir -p "$log_dir"
+  exec >>"$log_file" 2>&1
+
+  log ""
+  log "=================================================="
+  log "Weekly cleanup started: $(timestamp) (mode: $mode)"
+  log "=================================================="
+
+  if (( EUID == 0 )); then
+    log "FATAL: refusing to run as root."
+    send_notification "Cleanup stopped: refusing to run as root."
+    log "Final status: failed at $(timestamp)"
+    return 1
+  fi
+
+  # Checked up front in every mode, so a bad target list can never reach a
+  # dialog — not even the menu.
+  if ! validate_cleanup_targets; then
+    send_notification "Cleanup stopped: a target failed the Swift/Xcode safety check. See the log."
+    log "Final status: failed (fatal safety check) at $(timestamp)"
+    return 1
+  fi
+
+  action="$mode"
+
+  if [[ "$mode" == "menu" ]]; then
+    case "$(show_main_menu_dialog)" in
+      "Cleanup") action="cleanup" ;;
+      "Scan")    action="scan" ;;
+      *)
+        log "No action selected: the menu was canceled, timed out, or failed."
+        log "Final status: canceled at $(timestamp)"
+        return 0
+        ;;
+    esac
+    log "Selected action: $action"
+  fi
+
+  case "$action" in
+    scan)    run_storage_scan;  rc=$? ;;
+    cleanup) run_cleanup_flow;  rc=$? ;;
+  esac
+
+  return $rc
 }
 
 # Run main only when executed directly; sourcing (used by the test suite)
 # loads the functions without side effects.
 if [[ "${zsh_eval_context[-1]:-toplevel}" == "toplevel" ]]; then
   main "$@"
+  exit $?
 fi
